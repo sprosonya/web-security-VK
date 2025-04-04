@@ -1,79 +1,102 @@
 package server
 
 import (
+	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"time"
 )
 
-func (s *ProxyServer) handleHTTP(w http.ResponseWriter, r *http.Request) {
-	log.Println("HTTP request:", r.Method, r.URL)
+func (p *ProxyServer) handlerHTTP(w http.ResponseWriter, r *http.Request) {
+	outReq := new(http.Request)
+	*outReq = *r
 
-	r.Header.Del("Proxy-Connection")
-
-	targetURL := r.URL
-	if r.URL.Scheme == "" {
-		targetURL.Scheme = "http"
-	}
-	if r.URL.Host == "" {
-		targetURL.Host = r.Host
-	}
-
-	req, err := http.NewRequest(r.Method, targetURL.String(), r.Body)
+	resp, err := http.DefaultTransport.RoundTrip(outReq)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	req.Header = r.Header
-	req.Host = r.Host
-	resp, err := http.DefaultTransport.RoundTrip(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	defer resp.Body.Close()
-	for k, v := range resp.Header {
-		w.Header()[k] = v
+
+	for key, values := range resp.Header {
+		for _, value := range values {
+			w.Header().Add(key, value)
+		}
 	}
 	w.WriteHeader(resp.StatusCode)
-	_, err = io.Copy(w, resp.Body)
-	if err != nil {
-		log.Println("Error copying response body:", err)
-	}
+
+	io.Copy(w, resp.Body)
 }
 
-func (s *ProxyServer) handleHTTPS(w http.ResponseWriter, r *http.Request) {
-	log.Println("HTTPS CONNECT request:", r.Host)
-
-	targetConn, err := net.DialTimeout("tcp", r.Host, 10*time.Second)
+func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("get query", r.Host, r.Method, r.URL)
+	clientConn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "Hijacking not supported", http.StatusInternalServerError)
-		return
-	}
+	clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
 
-	clientConn, _, err := hijacker.Hijack()
+	host, _, err := net.SplitHostPort(r.Host)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		host = r.Host
+	}
+
+	cert, err := p.getCert(host)
+	if err != nil {
+		log.Printf("Failed to generate cert for %s: %v", host, err)
+		clientConn.Close()
 		return
 	}
 
-	go s.tunnel(clientConn, targetConn)
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{*cert},
+		NextProtos:   []string{"http/1.1"},
+		MinVersion:   tls.VersionTLS12,
+		CurvePreferences: []tls.CurveID{
+			tls.CurveP256,
+			tls.X25519,
+		},
+	}
+
+	tlsClientConn := tls.Server(clientConn, tlsConfig)
+	if err := tlsClientConn.Handshake(); err != nil {
+		log.Printf("TLS handshake error with client: %v", err)
+		tlsClientConn.Close()
+		return
+	}
+
+	upstreamConn, err := tls.Dial("tcp", r.Host, &tls.Config{
+		InsecureSkipVerify: true,
+	})
+	if err != nil {
+		log.Printf("Failed to connect to upstream %s: %v", r.Host, err)
+		tlsClientConn.Close()
+		return
+	}
+
+	go p.pipeConnections(tlsClientConn, upstreamConn)
 }
 
-func (s *ProxyServer) tunnel(clientConn net.Conn, targetConn net.Conn) {
+func (p *ProxyServer) pipeConnections(clientConn, upstreamConn net.Conn) {
 	defer clientConn.Close()
-	defer targetConn.Close()
+	defer upstreamConn.Close()
 
-	go io.Copy(targetConn, clientConn)
-	io.Copy(clientConn, targetConn)
+	done := make(chan struct{}, 2)
+
+	go func() {
+		io.Copy(upstreamConn, clientConn)
+		done <- struct{}{}
+	}()
+
+	go func() {
+		io.Copy(clientConn, upstreamConn)
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
 }

@@ -1,114 +1,69 @@
 package server
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/rsa"
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
-	"encoding/pem"
+	"fmt"
 	"math/big"
-	"net"
 	"time"
 )
 
-func loadCA() ([]byte, []byte, error) {
-	ca := &x509.Certificate{
-		SerialNumber: big.NewInt(2023),
+func (p *ProxyServer) getCert(hostname string) (*tls.Certificate, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.CertCounter++
+
+	caCert, err := x509.ParseCertificate(p.CA.Certificate[0])
+	if err != nil {
+		return nil, fmt.Errorf("parse CA cert: %v", err)
+	}
+
+	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate private key: %v", err)
+	}
+
+	serial := big.NewInt(int64(p.CertCounter))
+	template := x509.Certificate{
+		SerialNumber: serial,
 		Subject: pkix.Name{
-			Organization:  []string{"Proxy CA"},
-			Country:       []string{"US"},
-			Province:      []string{""},
-			Locality:      []string{"San Francisco"},
-			StreetAddress: []string{"Golden Gate Bridge"},
-			PostalCode:    []string{"94016"},
+			CommonName: hostname,
 		},
-		NotBefore:             time.Now(),
-		NotAfter:              time.Now().AddDate(10, 0, 0),
-		IsCA:                  true,
-		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageCertSign,
+		NotBefore: time.Now().Add(-24 * time.Hour),
+		NotAfter:  time.Now().Add(365 * 24 * time.Hour),
+		KeyUsage:  x509.KeyUsageKeyEncipherment | x509.KeyUsageDigitalSignature,
+		ExtKeyUsage: []x509.ExtKeyUsage{
+			x509.ExtKeyUsageServerAuth,
+			x509.ExtKeyUsageClientAuth,
+		},
 		BasicConstraintsValid: true,
+		DNSNames:              []string{hostname},
+		SubjectKeyId:          []byte{1, 2, 3, 4, 6},
 	}
 
-	caPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
+	derBytes, err := x509.CreateCertificate(
+		rand.Reader,
+		&template,
+		caCert,
+		&priv.PublicKey,
+		p.CA.PrivateKey,
+	)
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("create certificate: %v", err)
 	}
 
-	caBytes, err := x509.CreateCertificate(rand.Reader, ca, ca, &caPrivKey.PublicKey, caPrivKey)
+	leafCert, err := x509.ParseCertificate(derBytes)
 	if err != nil {
-		return nil, nil, err
+		return nil, fmt.Errorf("parse leaf cert: %v", err)
 	}
 
-	caPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: caBytes,
-	})
-
-	caPrivKeyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(caPrivKey),
-	})
-
-	return caPEM, caPrivKeyPEM, nil
-}
-
-func (s *ProxyServer) generateCert(host string) (tls.Certificate, error) {
-
-	caCert, err := x509.ParseCertificate(s.caCert)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	caKey, err := x509.ParsePKCS1PrivateKey(s.caKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	cert := &x509.Certificate{
-		SerialNumber: big.NewInt(1658),
-		Subject: pkix.Name{
-			Organization: []string{"Proxy Certificate"},
-			CommonName:   host,
-		},
-		NotBefore:    time.Now(),
-		NotAfter:     time.Now().AddDate(1, 0, 0),
-		SubjectKeyId: []byte{1, 2, 3, 4, 6},
-		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth, x509.ExtKeyUsageServerAuth},
-		KeyUsage:     x509.KeyUsageDigitalSignature,
-	}
-
-	if ip := net.ParseIP(host); ip != nil {
-		cert.IPAddresses = []net.IP{ip}
-	} else {
-		cert.DNSNames = []string{host}
-	}
-
-	certPrivKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	certBytes, err := x509.CreateCertificate(rand.Reader, cert, caCert, &certPrivKey.PublicKey, caKey)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	certPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE",
-		Bytes: certBytes,
-	})
-
-	certPrivKeyPEM := pem.EncodeToMemory(&pem.Block{
-		Type:  "RSA PRIVATE KEY",
-		Bytes: x509.MarshalPKCS1PrivateKey(certPrivKey),
-	})
-
-	tlsCert, err := tls.X509KeyPair(certPEM, certPrivKeyPEM)
-	if err != nil {
-		return tls.Certificate{}, err
-	}
-
-	return tlsCert, nil
+	return &tls.Certificate{
+		Certificate: [][]byte{derBytes, p.CA.Certificate[0]},
+		PrivateKey:  priv,
+		Leaf:        leafCert,
+	}, nil
 }

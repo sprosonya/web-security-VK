@@ -7,12 +7,13 @@ import (
 )
 
 func main() {
+	var p server.ProxyServer
 	config, err := cfg.GetConfig("./cfg/config.yaml")
 	if err != nil {
-		log.Printf("could not load configuration: %v", err)
+		log.Fatalf("Could not load configuration: %v", err)
 	}
-	var proxy server.ProxyServer
-	if err := proxy.Start(config); err != nil {
-		log.Fatal(err)
+	err = p.Start(config)
+	if err != nil {
+		log.Fatalf("Could not start proxy: %v", err)
 	}
 }
