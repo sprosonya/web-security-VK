@@ -11,6 +11,17 @@ type Config struct {
 		Host string `yaml:"host"`
 		Port string `yaml:"port"`
 	} `yaml:"server"`
+	Postgres struct {
+		Host     string `yaml:"host"`
+		Port     string `yaml:"port"`
+		Username string `yaml:"user"`
+		Password string `yaml:"password"`
+		Database string `yaml:"dbname"`
+	} `yaml:"postgres"`
+	APIServer struct {
+		Host string `yaml:"host"`
+		Port string `yaml:"port"`
+	} `yaml:"apiserver"`
 }
 
 func GetConfig(path string) (*Config, error) {
