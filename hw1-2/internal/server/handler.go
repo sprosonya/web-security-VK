@@ -85,10 +85,9 @@ func (s *ProxyServer) handleRepeatRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Исправляем URL, добавляя схему если отсутствует
 	targetURL := req.URL
 	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
-		targetURL = "http://" + targetURL // или https:// в зависимости от вашего случая
+		targetURL = "http://" + targetURL
 	}
 
 	parsedURL, err := url.Parse(targetURL)
@@ -97,7 +96,6 @@ func (s *ProxyServer) handleRepeatRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Создаем новый запрос
 	var bodyReader io.Reader
 	if req.Body != "" {
 		bodyReader = strings.NewReader(req.Body)
@@ -109,17 +107,14 @@ func (s *ProxyServer) handleRepeatRequest(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// Копируем заголовки
 	for k, v := range req.Headers {
 		newReq.Header.Set(k, v)
 	}
 
-	// Добавляем cookies
 	for k, v := range req.Cookies {
 		newReq.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
-	// Настраиваем HTTP клиент с таймаутами
 	client := &http.Client{
 		Timeout: 30 * time.Second,
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -127,7 +122,6 @@ func (s *ProxyServer) handleRepeatRequest(w http.ResponseWriter, r *http.Request
 		},
 	}
 
-	// Выполняем запрос
 	resp, err := client.Do(newReq)
 	if err != nil {
 		http.Error(w, `{"error": "Request failed: `+err.Error()+`"}`, http.StatusInternalServerError)
@@ -135,14 +129,12 @@ func (s *ProxyServer) handleRepeatRequest(w http.ResponseWriter, r *http.Request
 	}
 	defer resp.Body.Close()
 
-	// Читаем тело ответа
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		http.Error(w, `{"error": "Failed to read response: `+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
 
-	// Формируем ответ
 	response := map[string]interface{}{
 		"status":     resp.StatusCode,
 		"statusText": resp.Status,
@@ -235,7 +227,6 @@ func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Фиксим Content-Length перед сохранением запроса
 	fixContentLength(req)
 
 	httpReq := p.parseRequest(req)
@@ -252,11 +243,9 @@ func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
 	}
 	defer targetConn.Close()
 
-	// Удаляем проблемные заголовки
 	req.Header.Del("Accept-Encoding")
 	req.Header.Del("Keep-Alive")
 
-	// Фиксим запрос перед отправкой
 	if err := fixRequest(req); err != nil {
 		log.Printf("Error fixing request: %v", err)
 		return
@@ -284,7 +273,6 @@ func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// Вспомогательные функции
 func fixContentLength(req *http.Request) {
 	if req.Body == nil || req.Body == http.NoBody {
 		req.ContentLength = 0
@@ -293,21 +281,18 @@ func fixContentLength(req *http.Request) {
 }
 
 func fixRequest(req *http.Request) error {
-	// Если тело пустое, но указан Content-Length - исправляем
 	if req.Body == nil || req.Body == http.NoBody {
 		req.ContentLength = 0
 		req.Header.Del("Content-Length")
 		return nil
 	}
 
-	// Читаем тело, чтобы определить реальную длину
 	body, err := io.ReadAll(req.Body)
 	if err != nil {
 		return err
 	}
 	req.Body.Close()
 
-	// Устанавливаем правильные значения
 	req.ContentLength = int64(len(body))
 	req.Body = io.NopCloser(bytes.NewReader(body))
 
@@ -333,7 +318,6 @@ func (s *ProxyServer) parseResponse(resp *http.Response, reqID int) *repository.
 		IDRequest: reqID,
 	}
 
-	// Копируем заголовки, исключая Content-Encoding
 	for k, v := range resp.Header {
 		if !strings.EqualFold(k, "Content-Encoding") {
 			response.Headers[k] = strings.Join(v, ",")
@@ -420,7 +404,6 @@ func (s *ProxyServer) parseRequest(r *http.Request) *repository.Request {
 	return req
 }
 
-// Обработчик для сканирования уязвимостей
 func (p *ProxyServer) handleScanRequest(w http.ResponseWriter, r *http.Request) {
 	vars := mux.Vars(r)
 	id, err := strconv.Atoi(vars["id"])
@@ -429,7 +412,6 @@ func (p *ProxyServer) handleScanRequest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Получаем запрос из БД
 	exists, req, err := p.repo.GetByID(id)
 	if err != nil {
 		http.Error(w, `{"error": "Database error"}`, http.StatusInternalServerError)
@@ -440,19 +422,15 @@ func (p *ProxyServer) handleScanRequest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	// Сканируем на уязвимости
 	report := p.scanRequestForVulnerabilities(req)
 
-	// Формируем JSON ответ
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(report)
 }
 
-// Сканирование запроса на уязвимости
 func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map[string]interface{} {
 	vulnerabilities := make([]map[string]string, 0)
 
-	// Проверяем GET параметры
 	for param, value := range req.GetParams {
 		if vulns := p.detectInjection(value); len(vulns) > 0 {
 			for _, vuln := range vulns {
@@ -467,7 +445,6 @@ func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map
 		}
 	}
 
-	// Проверяем POST параметры
 	for param, value := range req.PostParams {
 		if vulns := p.detectInjection(value); len(vulns) > 0 {
 			for _, vuln := range vulns {
@@ -482,7 +459,6 @@ func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map
 		}
 	}
 
-	// Проверяем Cookies
 	for name, value := range req.Cookies {
 		if vulns := p.detectInjection(value); len(vulns) > 0 {
 			for _, vuln := range vulns {
@@ -497,7 +473,6 @@ func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map
 		}
 	}
 
-	// Проверяем Headers
 	for name, value := range req.Headers {
 		if vulns := p.detectInjection(value); len(vulns) > 0 {
 			for _, vuln := range vulns {
@@ -512,7 +487,6 @@ func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map
 		}
 	}
 
-	// Проверяем тело запроса
 	if req.Body != "" {
 		if vulns := p.detectInjection(req.Body); len(vulns) > 0 {
 			for _, vuln := range vulns {
@@ -527,7 +501,6 @@ func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map
 		}
 	}
 
-	// Формируем итоговый отчет
 	return map[string]interface{}{
 		"request_id":            req.ID,
 		"request_url":           req.URL,
