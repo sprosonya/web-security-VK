@@ -25,6 +25,7 @@ type Response struct {
 	Headers   map[string]string
 	Body      string
 	IDRequest int
+	IsBase64  bool
 }
 
 type Repository interface {
@@ -133,16 +134,20 @@ func (r *RepositoryService) WriteResponse(response *Response) error {
 	headers, _ := json.Marshal(response.Headers)
 
 	_, err := r.db.Exec(
-		`INSERT INTO responses (code, message, headers, body, req_id) 
-		VALUES ($1, $2, $3, $4, $5)`,
+		`INSERT INTO responses (code, message, headers, body, req_id, is_base64) 
+		VALUES ($1, $2, $3, $4, $5, $6)`,
 		response.Code,
 		response.Message,
 		headers,
 		response.Body,
 		response.IDRequest,
+		response.IsBase64,
 	)
 
 	if err != nil {
+		//fmt.Println("RESPONSE", response.Code, response.Message, headers, response.Body, response.IDRequest)
+
+		log.Println("\n\n\nERROR\n\n\n")
 		log.Println(err.Error())
 		return err
 	}

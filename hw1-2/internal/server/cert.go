@@ -44,7 +44,7 @@ func (p *ProxyServer) getCert(hostname string) (*tls.Certificate, error) {
 		DNSNames:              []string{hostname},
 		SubjectKeyId:          []byte{1, 2, 3, 4, 6},
 	}
-
+	fmt.Println("CERT", hostname)
 	derBytes, err := x509.CreateCertificate(
 		rand.Reader,
 		&template,

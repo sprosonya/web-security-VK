@@ -17,7 +17,7 @@ type Config struct {
 		Username string `yaml:"user"`
 		Password string `yaml:"password"`
 		Database string `yaml:"dbname"`
-	} `yaml:"postgres"`
+	} `yaml:"db"`
 	APIServer struct {
 		Host string `yaml:"host"`
 		Port string `yaml:"port"`

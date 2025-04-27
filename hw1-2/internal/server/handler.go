@@ -1,20 +1,25 @@
 package server
 
 import (
+	"bufio"
 	"bytes"
+	"compress/flate"
 	"compress/gzip"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/andybalholm/brotli"
 	"github.com/gorilla/mux"
 	"io"
 	"log"
-	"net"
 	"net/http"
 	"net/url"
 	"proxy/internal/repository"
 	"strconv"
 	"strings"
+	"time"
+	"unicode/utf8"
 )
 
 func (s *ProxyServer) handleRequests(w http.ResponseWriter, r *http.Request) {
@@ -66,62 +71,96 @@ func (s *ProxyServer) handleRepeatRequest(w http.ResponseWriter, r *http.Request
 	vars := mux.Vars(r)
 	id, err := strconv.Atoi(vars["id"])
 	if err != nil {
-		http.Error(w, "Invalid ID", http.StatusBadRequest)
+		http.Error(w, `{"error": "Invalid ID"}`, http.StatusBadRequest)
 		return
 	}
 
 	exists, req, err := s.repo.GetByID(id)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
 	if !exists {
-		http.Error(w, "Request not found", http.StatusNotFound)
+		http.Error(w, `{"error": "Request not found"}`, http.StatusNotFound)
 		return
 	}
 
-	parsedURL, err := url.Parse(req.URL)
+	// Исправляем URL, добавляя схему если отсутствует
+	targetURL := req.URL
+	if !strings.HasPrefix(targetURL, "http://") && !strings.HasPrefix(targetURL, "https://") {
+		targetURL = "http://" + targetURL // или https:// в зависимости от вашего случая
+	}
+
+	parsedURL, err := url.Parse(targetURL)
 	if err != nil {
-		http.Error(w, "Invalid URL", http.StatusInternalServerError)
+		http.Error(w, `{"error": "Invalid URL: `+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
 
-	newReq, err := http.NewRequest(req.Method, parsedURL.String(), strings.NewReader(req.Body))
+	// Создаем новый запрос
+	var bodyReader io.Reader
+	if req.Body != "" {
+		bodyReader = strings.NewReader(req.Body)
+	}
+
+	newReq, err := http.NewRequest(req.Method, parsedURL.String(), bodyReader)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, `{"error": "`+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
 
+	// Копируем заголовки
 	for k, v := range req.Headers {
 		newReq.Header.Set(k, v)
 	}
 
+	// Добавляем cookies
 	for k, v := range req.Cookies {
 		newReq.AddCookie(&http.Cookie{Name: k, Value: v})
 	}
 
-	client := &http.Client{}
+	// Настраиваем HTTP клиент с таймаутами
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse // Не следовать редиректам
+		},
+	}
+
+	// Выполняем запрос
 	resp, err := client.Do(newReq)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, `{"error": "Request failed: `+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
 	defer resp.Body.Close()
 
+	// Читаем тело ответа
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		http.Error(w, `{"error": "Failed to read response: `+err.Error()+`"}`, http.StatusInternalServerError)
 		return
 	}
 
+	// Формируем ответ
+	response := map[string]interface{}{
+		"status":     resp.StatusCode,
+		"statusText": resp.Status,
+		"headers":    resp.Header,
+		"body":       string(body),
+	}
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"status": resp.StatusCode,
-		"body":   string(body),
-	})
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode response: %v", err)
+	}
 }
 
 func (p *ProxyServer) handlerHTTP(w http.ResponseWriter, r *http.Request) {
+	req := p.parseRequest(r)
+	if err := p.repo.WriteRequest(req); err != nil {
+		log.Println(err)
+	}
 	outReq := new(http.Request)
 	*outReq = *r
 
@@ -131,6 +170,11 @@ func (p *ProxyServer) handlerHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer resp.Body.Close()
+
+	respStruct := p.parseResponse(resp, req.ID)
+	if err := p.repo.WriteResponse(respStruct); err != nil {
+		log.Println(err)
+	}
 
 	for key, values := range resp.Header {
 		for _, value := range values {
@@ -143,29 +187,26 @@ func (p *ProxyServer) handlerHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
-	req := p.parseRequest(r)
-	if err := p.repo.WriteRequest(req); err != nil {
-		log.Println(err)
-	}
-
-	fmt.Println("get query", r.Host, r.Method, r.URL)
 	clientConn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		log.Printf("Hijack error: %v", err)
+		return
+	}
+	defer clientConn.Close()
+
+	if _, err := clientConn.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
+		log.Printf("Error writing 200 OK: %v", err)
 		return
 	}
 
-	clientConn.Write([]byte("HTTP/1.1 200 OK\r\n\r\n"))
-
-	host, _, err := net.SplitHostPort(r.Host)
-	if err != nil {
-		host = r.Host
+	host := r.Host
+	if !strings.Contains(host, ":") {
+		host += ":443"
 	}
 
-	cert, err := p.getCert(host)
+	cert, err := p.getCert(strings.Split(host, ":")[0])
 	if err != nil {
-		log.Printf("Failed to generate cert for %s: %v", host, err)
-		clientConn.Close()
+		log.Printf("Get certificate error: %v", err)
 		return
 	}
 
@@ -173,49 +214,170 @@ func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
 		Certificates: []tls.Certificate{*cert},
 		NextProtos:   []string{"http/1.1"},
 		MinVersion:   tls.VersionTLS12,
-		CurvePreferences: []tls.CurveID{
-			tls.CurveP256,
-			tls.X25519,
-		},
 	}
 
-	tlsClientConn := tls.Server(clientConn, tlsConfig)
-	if err := tlsClientConn.Handshake(); err != nil {
-		log.Printf("TLS handshake error with client: %v", err)
-		tlsClientConn.Close()
+	tlsConn := tls.Server(clientConn, tlsConfig)
+	defer tlsConn.Close()
+
+	if err := tlsConn.Handshake(); err != nil {
+		if !isExpectedTLSHandshakeError(err) {
+			log.Printf("TLS handshake error: %v", err)
+		}
 		return
 	}
 
-	upstreamConn, err := tls.Dial("tcp", r.Host, &tls.Config{
+	bufReader := bufio.NewReader(tlsConn)
+	req, err := http.ReadRequest(bufReader)
+	if err != nil {
+		if !isExpectedReadError(err) {
+			log.Printf("Error reading request: %v", err)
+		}
+		return
+	}
+
+	// Фиксим Content-Length перед сохранением запроса
+	fixContentLength(req)
+
+	httpReq := p.parseRequest(req)
+	if err := p.repo.WriteRequest(httpReq); err != nil {
+		log.Printf("Error saving request: %v", err)
+	}
+
+	targetConn, err := tls.Dial("tcp", host, &tls.Config{
 		InsecureSkipVerify: true,
 	})
 	if err != nil {
-		log.Printf("Failed to connect to upstream %s: %v", r.Host, err)
-		tlsClientConn.Close()
+		log.Printf("Error dialing target: %v", err)
+		return
+	}
+	defer targetConn.Close()
+
+	// Удаляем проблемные заголовки
+	req.Header.Del("Accept-Encoding")
+	req.Header.Del("Keep-Alive")
+
+	// Фиксим запрос перед отправкой
+	if err := fixRequest(req); err != nil {
+		log.Printf("Error fixing request: %v", err)
 		return
 	}
 
-	go p.pipeConnections(tlsClientConn, upstreamConn)
+	if err := req.Write(targetConn); err != nil {
+		log.Printf("Error writing to target: %v", err)
+		return
+	}
+
+	resp, err := http.ReadResponse(bufio.NewReader(targetConn), req)
+	if err != nil {
+		log.Printf("Error reading response: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	httpResp := p.parseResponse(resp, httpReq.ID)
+	if err := p.repo.WriteResponse(httpResp); err != nil {
+		log.Printf("Error saving response: %v", err)
+	}
+
+	if err := resp.Write(tlsConn); err != nil {
+		log.Printf("Error writing response to client: %v", err)
+	}
 }
 
-func (p *ProxyServer) pipeConnections(clientConn, upstreamConn net.Conn) {
-	defer clientConn.Close()
-	defer upstreamConn.Close()
+// Вспомогательные функции
+func fixContentLength(req *http.Request) {
+	if req.Body == nil || req.Body == http.NoBody {
+		req.ContentLength = 0
+		req.Header.Del("Content-Length")
+	}
+}
 
-	done := make(chan struct{}, 2)
+func fixRequest(req *http.Request) error {
+	// Если тело пустое, но указан Content-Length - исправляем
+	if req.Body == nil || req.Body == http.NoBody {
+		req.ContentLength = 0
+		req.Header.Del("Content-Length")
+		return nil
+	}
 
-	go func() {
-		io.Copy(upstreamConn, clientConn)
-		done <- struct{}{}
-	}()
+	// Читаем тело, чтобы определить реальную длину
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		return err
+	}
+	req.Body.Close()
 
-	go func() {
-		io.Copy(clientConn, upstreamConn)
-		done <- struct{}{}
-	}()
+	// Устанавливаем правильные значения
+	req.ContentLength = int64(len(body))
+	req.Body = io.NopCloser(bytes.NewReader(body))
 
-	<-done
-	<-done
+	return nil
+}
+
+func isExpectedTLSHandshakeError(err error) bool {
+	return err == io.EOF ||
+		strings.Contains(err.Error(), "use of closed network connection") ||
+		strings.Contains(err.Error(), "reset by peer")
+}
+
+func isExpectedReadError(err error) bool {
+	return isExpectedTLSHandshakeError(err) ||
+		strings.Contains(err.Error(), "malformed HTTP")
+}
+
+func (s *ProxyServer) parseResponse(resp *http.Response, reqID int) *repository.Response {
+	response := &repository.Response{
+		Code:      resp.StatusCode,
+		Message:   resp.Status,
+		Headers:   make(map[string]string),
+		IDRequest: reqID,
+	}
+
+	// Копируем заголовки, исключая Content-Encoding
+	for k, v := range resp.Header {
+		if !strings.EqualFold(k, "Content-Encoding") {
+			response.Headers[k] = strings.Join(v, ",")
+		}
+	}
+
+	var body []byte
+	var err error
+
+	switch resp.Header.Get("Content-Encoding") {
+	case "gzip":
+		reader, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			log.Printf("Gzip decompression error: %v", err)
+			return response
+		}
+		body, err = io.ReadAll(reader)
+		reader.Close()
+	case "deflate":
+		reader := flate.NewReader(resp.Body)
+		body, err = io.ReadAll(reader)
+		reader.Close()
+	case "br":
+		reader := brotli.NewReader(resp.Body)
+		body, err = io.ReadAll(reader)
+	default:
+		body, err = io.ReadAll(resp.Body)
+	}
+
+	if err != nil {
+		log.Printf("Error reading response body: %v", err)
+		return response
+	}
+
+	if !utf8.Valid(body) {
+		response.Body = base64.StdEncoding.EncodeToString(body)
+		response.IsBase64 = true
+	} else {
+		response.Body = string(body)
+	}
+
+	resp.Body = io.NopCloser(bytes.NewBuffer(body))
+
+	return response
 }
 
 func (s *ProxyServer) parseRequest(r *http.Request) *repository.Request {
@@ -258,28 +420,150 @@ func (s *ProxyServer) parseRequest(r *http.Request) *repository.Request {
 	return req
 }
 
-func (s *ProxyServer) parseResponse(resp *http.Response, reqID int) *repository.Response {
-	response := &repository.Response{
-		Code:      resp.StatusCode,
-		Message:   resp.Status,
-		Headers:   make(map[string]string),
-		IDRequest: reqID,
+// Обработчик для сканирования уязвимостей
+func (p *ProxyServer) handleScanRequest(w http.ResponseWriter, r *http.Request) {
+	vars := mux.Vars(r)
+	id, err := strconv.Atoi(vars["id"])
+	if err != nil {
+		http.Error(w, `{"error": "Invalid ID"}`, http.StatusBadRequest)
+		return
 	}
 
-	for k, v := range resp.Header {
-		response.Headers[k] = strings.Join(v, ",")
+	// Получаем запрос из БД
+	exists, req, err := p.repo.GetByID(id)
+	if err != nil {
+		http.Error(w, `{"error": "Database error"}`, http.StatusInternalServerError)
+		return
+	}
+	if !exists {
+		http.Error(w, `{"error": "Request not found"}`, http.StatusNotFound)
+		return
 	}
 
-	var body []byte
-	if strings.Contains(resp.Header.Get("Content-Encoding"), "gzip") {
-		reader, _ := gzip.NewReader(resp.Body)
-		body, _ = io.ReadAll(reader)
-		resp.Body = io.NopCloser(bytes.NewBuffer(body))
-	} else {
-		body, _ = io.ReadAll(resp.Body)
-		resp.Body = io.NopCloser(bytes.NewBuffer(body))
-	}
-	response.Body = string(body)
+	// Сканируем на уязвимости
+	report := p.scanRequestForVulnerabilities(req)
 
-	return response
+	// Формируем JSON ответ
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(report)
+}
+
+// Сканирование запроса на уязвимости
+func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map[string]interface{} {
+	vulnerabilities := make([]map[string]string, 0)
+
+	// Проверяем GET параметры
+	for param, value := range req.GetParams {
+		if vulns := p.detectInjection(value); len(vulns) > 0 {
+			for _, vuln := range vulns {
+				vulnerabilities = append(vulnerabilities, map[string]string{
+					"type":        "Command Injection",
+					"parameter":   "GET:" + param,
+					"payload":     vuln.payload,
+					"description": vuln.description,
+					"severity":    "High",
+				})
+			}
+		}
+	}
+
+	// Проверяем POST параметры
+	for param, value := range req.PostParams {
+		if vulns := p.detectInjection(value); len(vulns) > 0 {
+			for _, vuln := range vulns {
+				vulnerabilities = append(vulnerabilities, map[string]string{
+					"type":        "Command Injection",
+					"parameter":   "POST:" + param,
+					"payload":     vuln.payload,
+					"description": vuln.description,
+					"severity":    "High",
+				})
+			}
+		}
+	}
+
+	// Проверяем Cookies
+	for name, value := range req.Cookies {
+		if vulns := p.detectInjection(value); len(vulns) > 0 {
+			for _, vuln := range vulns {
+				vulnerabilities = append(vulnerabilities, map[string]string{
+					"type":        "Command Injection",
+					"parameter":   "COOKIE:" + name,
+					"payload":     vuln.payload,
+					"description": vuln.description,
+					"severity":    "High",
+				})
+			}
+		}
+	}
+
+	// Проверяем Headers
+	for name, value := range req.Headers {
+		if vulns := p.detectInjection(value); len(vulns) > 0 {
+			for _, vuln := range vulns {
+				vulnerabilities = append(vulnerabilities, map[string]string{
+					"type":        "Command Injection",
+					"parameter":   "HEADER:" + name,
+					"payload":     vuln.payload,
+					"description": vuln.description,
+					"severity":    "High",
+				})
+			}
+		}
+	}
+
+	// Проверяем тело запроса
+	if req.Body != "" {
+		if vulns := p.detectInjection(req.Body); len(vulns) > 0 {
+			for _, vuln := range vulns {
+				vulnerabilities = append(vulnerabilities, map[string]string{
+					"type":        "Command Injection",
+					"parameter":   "BODY",
+					"payload":     vuln.payload,
+					"description": vuln.description,
+					"severity":    "High",
+				})
+			}
+		}
+	}
+
+	// Формируем итоговый отчет
+	return map[string]interface{}{
+		"request_id":            req.ID,
+		"request_url":           req.URL,
+		"scan_date":             time.Now().Format(time.RFC3339),
+		"total_vulnerabilities": len(vulnerabilities),
+		"vulnerabilities":       vulnerabilities,
+	}
+}
+
+// Детектор инъекций
+func (p *ProxyServer) detectInjection(input string) []struct {
+	payload     string
+	description string
+} {
+	injectionTests := []struct {
+		payload     string
+		description string
+	}{
+		{`;cat /etc/passwd;`, "Попытка чтения /etc/passwd (через ;)"},
+		{`|cat /etc/passwd|`, "Попытка чтения /etc/passwd (через |)"},
+		{"`cat /etc/passwd`", "Попытка чтения /etc/passwd (через backticks)"},
+		{"$(cat /etc/passwd)", "Попытка чтения /etc/passwd (через $())"},
+		{";id;", "Попытка выполнения команды id"},
+		{"|uname -a|", "Попытка получения системной информации"},
+	}
+
+	var detected []struct {
+		payload     string
+		description string
+	}
+
+	for _, test := range injectionTests {
+		if strings.Contains(input, test.payload) {
+			detected = append(detected, test)
+		}
+	}
+
+	return detected
 }

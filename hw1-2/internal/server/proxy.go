@@ -54,7 +54,8 @@ func (s *ProxyServer) Start(cfg *cfg.Config) error {
 	apiRouter := r.PathPrefix("/api").Subrouter()
 	apiRouter.HandleFunc("/requests", s.handleRequests).Methods("GET")
 	apiRouter.HandleFunc("/requests/{id:[0-9]+}", s.handleSingleRequest).Methods("GET")
-	apiRouter.HandleFunc("/repeat/{id:[0-9]+}", s.handleRepeatRequest).Methods("POST")
+	apiRouter.HandleFunc("/repeat/{id:[0-9]+}", s.handleRepeatRequest).Methods("GET")
+	r.HandleFunc("/scan/{id:[0-9]+}", s.handleScanRequest).Methods("GET")
 	go func() {
 		addr := cfg.APIServer.Host + ":" + cfg.APIServer.Port
 		if err := http.ListenAndServe(addr, r); err != nil {
