@@ -420,7 +420,7 @@ func (p *ProxyServer) handleScanRequest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	exists, req, err := p.repo.GetByID(id)
+	exists, originalReq, err := p.repo.GetByID(id)
 	if err != nil {
 		http.Error(w, `{"error": "Database error"}`, http.StatusInternalServerError)
 		return
@@ -430,118 +430,225 @@ func (p *ProxyServer) handleScanRequest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	report := p.scanRequestForVulnerabilities(req)
+	report := p.scanRequestForVulnerabilities(originalReq)
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(report)
 }
 
-func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map[string]interface{} {
+func (p *ProxyServer) scanRequestForVulnerabilities(originalReq *repository.Request) map[string]interface{} {
 	vulnerabilities := make([]map[string]string, 0)
 
-	for param, value := range req.GetParams {
-		if vulns := p.detectInjection(value); len(vulns) > 0 {
-			for _, vuln := range vulns {
+	injectionTests := []struct {
+		payload     string
+		description string
+	}{
+		{`;cat /etc/passwd;`, "Command Injection через ;"},
+		{`|cat /etc/passwd|`, "Command Injection через |"},
+		{"`cat /etc/passwd`", "Command Injection через backticks"},
+		{"$(cat /etc/passwd)", "Command Injection через $()"},
+	}
+
+	for param := range originalReq.GetParams {
+		for _, test := range injectionTests {
+			modifiedReq := p.cloneRequest(originalReq)
+			modifiedReq.GetParams[param] = test.payload
+
+			resp, err := p.sendModifiedRequest(modifiedReq)
+			if err != nil {
+				continue
+			}
+
+			if p.isResponseVulnerable(resp) {
 				vulnerabilities = append(vulnerabilities, map[string]string{
 					"type":        "Command Injection",
 					"parameter":   "GET:" + param,
-					"payload":     vuln.payload,
-					"description": vuln.description,
+					"payload":     test.payload,
+					"description": test.description,
 					"severity":    "High",
 				})
+				break
 			}
 		}
 	}
 
-	for param, value := range req.PostParams {
-		if vulns := p.detectInjection(value); len(vulns) > 0 {
-			for _, vuln := range vulns {
+	for param := range originalReq.PostParams {
+		for _, test := range injectionTests {
+			modifiedReq := p.cloneRequest(originalReq)
+			modifiedReq.PostParams[param] = test.payload
+
+			resp, err := p.sendModifiedRequest(modifiedReq)
+			if err != nil {
+				continue
+			}
+
+			if p.isResponseVulnerable(resp) {
 				vulnerabilities = append(vulnerabilities, map[string]string{
 					"type":        "Command Injection",
 					"parameter":   "POST:" + param,
-					"payload":     vuln.payload,
-					"description": vuln.description,
+					"payload":     test.payload,
+					"description": test.description,
 					"severity":    "High",
 				})
+				break
 			}
 		}
 	}
 
-	for name, value := range req.Cookies {
-		if vulns := p.detectInjection(value); len(vulns) > 0 {
-			for _, vuln := range vulns {
+	for name := range originalReq.Cookies {
+		for _, test := range injectionTests {
+			modifiedReq := p.cloneRequest(originalReq)
+			modifiedReq.Cookies[name] = test.payload
+
+			resp, err := p.sendModifiedRequest(modifiedReq)
+			if err != nil {
+				continue
+			}
+
+			if p.isResponseVulnerable(resp) {
 				vulnerabilities = append(vulnerabilities, map[string]string{
 					"type":        "Command Injection",
 					"parameter":   "COOKIE:" + name,
-					"payload":     vuln.payload,
-					"description": vuln.description,
+					"payload":     test.payload,
+					"description": test.description,
 					"severity":    "High",
 				})
+				break
 			}
 		}
 	}
 
-	for name, value := range req.Headers {
-		if vulns := p.detectInjection(value); len(vulns) > 0 {
-			for _, vuln := range vulns {
+	for name := range originalReq.Headers {
+		for _, test := range injectionTests {
+			modifiedReq := p.cloneRequest(originalReq)
+			modifiedReq.Headers[name] = test.payload
+
+			resp, err := p.sendModifiedRequest(modifiedReq)
+			if err != nil {
+				continue
+			}
+
+			if p.isResponseVulnerable(resp) {
 				vulnerabilities = append(vulnerabilities, map[string]string{
 					"type":        "Command Injection",
 					"parameter":   "HEADER:" + name,
-					"payload":     vuln.payload,
-					"description": vuln.description,
+					"payload":     test.payload,
+					"description": test.description,
 					"severity":    "High",
 				})
+				break
 			}
 		}
 	}
 
-	if req.Body != "" {
-		if vulns := p.detectInjection(req.Body); len(vulns) > 0 {
-			for _, vuln := range vulns {
+	if originalReq.Body != "" {
+		for _, test := range injectionTests {
+			modifiedReq := p.cloneRequest(originalReq)
+			modifiedReq.Body = test.payload
+
+			resp, err := p.sendModifiedRequest(modifiedReq)
+			if err != nil {
+				continue
+			}
+
+			if p.isResponseVulnerable(resp) {
 				vulnerabilities = append(vulnerabilities, map[string]string{
 					"type":        "Command Injection",
 					"parameter":   "BODY",
-					"payload":     vuln.payload,
-					"description": vuln.description,
+					"payload":     test.payload,
+					"description": test.description,
 					"severity":    "High",
 				})
+				break
 			}
 		}
 	}
 
 	return map[string]interface{}{
-		"request_id":            req.ID,
-		"request_url":           req.URL,
+		"request_id":            originalReq.ID,
+		"request_url":           originalReq.URL,
 		"scan_date":             time.Now().Format(time.RFC3339),
 		"total_vulnerabilities": len(vulnerabilities),
 		"vulnerabilities":       vulnerabilities,
 	}
 }
 
-func (p *ProxyServer) detectInjection(input string) []struct {
-	payload     string
-	description string
-} {
-	injectionTests := []struct {
-		payload     string
-		description string
-	}{
-		{`;cat /etc/passwd;`, "Попытка чтения /etc/passwd (через ;)"},
-		{`|cat /etc/passwd|`, "Попытка чтения /etc/passwd (через |)"},
-		{"`cat /etc/passwd`", "Попытка чтения /etc/passwd (через backticks)"},
-		{"$(cat /etc/passwd)", "Попытка чтения /etc/passwd (через $())"},
+func (p *ProxyServer) cloneRequest(orig *repository.Request) *repository.Request {
+	cloned := &repository.Request{
+		ID:         orig.ID,
+		Method:     orig.Method,
+		URL:        orig.URL,
+		Body:       orig.Body,
+		GetParams:  make(map[string]string),
+		PostParams: make(map[string]string),
+		Headers:    make(map[string]string),
+		Cookies:    make(map[string]string),
 	}
 
-	var detected []struct {
-		payload     string
-		description string
+	for k, v := range orig.GetParams {
+		cloned.GetParams[k] = v
+	}
+	for k, v := range orig.PostParams {
+		cloned.PostParams[k] = v
+	}
+	for k, v := range orig.Headers {
+		cloned.Headers[k] = v
+	}
+	for k, v := range orig.Cookies {
+		cloned.Cookies[k] = v
 	}
 
-	for _, test := range injectionTests {
-		if strings.Contains(input, test.payload) {
-			detected = append(detected, test)
+	return cloned
+}
+
+func (p *ProxyServer) sendModifiedRequest(req *repository.Request) (*http.Response, error) {
+	var body io.Reader
+	if req.Body != "" {
+		body = strings.NewReader(req.Body)
+	}
+
+	httpReq, err := http.NewRequest(req.Method, req.URL, body)
+	if err != nil {
+		return nil, err
+	}
+
+	q := httpReq.URL.Query()
+	for k, v := range req.GetParams {
+		q.Add(k, v)
+	}
+	httpReq.URL.RawQuery = q.Encode()
+
+	if req.Method == http.MethodPost || req.Method == http.MethodPut {
+		if len(req.PostParams) > 0 {
+			form := url.Values{}
+			for k, v := range req.PostParams {
+				form.Add(k, v)
+			}
+			httpReq.Body = io.NopCloser(strings.NewReader(form.Encode()))
+			httpReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		}
 	}
 
-	return detected
+	for k, v := range req.Headers {
+		httpReq.Header.Add(k, v)
+	}
+
+	for k, v := range req.Cookies {
+		httpReq.AddCookie(&http.Cookie{Name: k, Value: v})
+	}
+
+	client := &http.Client{}
+	return client.Do(httpReq)
+}
+
+func (p *ProxyServer) isResponseVulnerable(resp *http.Response) bool {
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return false
+	}
+
+	return strings.Contains(string(body), "root:") ||
+		strings.Contains(string(body), "/bin/bash") ||
+		strings.Contains(string(body), "/etc/passwd")
 }
