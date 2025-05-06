@@ -179,6 +179,7 @@ func (p *ProxyServer) handlerHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("AAAAAA")
 	clientConn, _, err := w.(http.Hijacker).Hijack()
 	if err != nil {
 		log.Printf("Hijack error: %v", err)
@@ -225,6 +226,13 @@ func (p *ProxyServer) handlerHTTPS(w http.ResponseWriter, r *http.Request) {
 			log.Printf("Error reading request: %v", err)
 		}
 		return
+	}
+
+	if req.URL.Host == "" {
+		req.URL.Host = r.Host
+	}
+	if req.URL.Scheme == "" {
+		req.URL.Scheme = "https"
 	}
 
 	fixContentLength(req)
@@ -510,7 +518,6 @@ func (p *ProxyServer) scanRequestForVulnerabilities(req *repository.Request) map
 	}
 }
 
-// Детектор инъекций
 func (p *ProxyServer) detectInjection(input string) []struct {
 	payload     string
 	description string
@@ -523,8 +530,6 @@ func (p *ProxyServer) detectInjection(input string) []struct {
 		{`|cat /etc/passwd|`, "Попытка чтения /etc/passwd (через |)"},
 		{"`cat /etc/passwd`", "Попытка чтения /etc/passwd (через backticks)"},
 		{"$(cat /etc/passwd)", "Попытка чтения /etc/passwd (через $())"},
-		{";id;", "Попытка выполнения команды id"},
-		{"|uname -a|", "Попытка получения системной информации"},
 	}
 
 	var detected []struct {

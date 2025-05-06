@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  proxy:
+    build: .
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+    environment:
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=proxy_user
+      - POSTGRES_PASSWORD=proxy_password
+      - POSTGRES_DB=proxy_db
+    volumes:
+      - ./certs:/app/certs
+
+
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      - POSTGRES_USER=proxy_user
+      - POSTGRES_PASSWORD=proxy_password
+      - POSTGRES_DB=proxy_db
+    volumes:
+      - ./docker/postgres/migrations.sql:/docker-entrypoint-initdb.d/migrations.sql
+    ports:
+      - "5432:5432"
+
+
